@@ -1,3 +1,6 @@
+export R_LIBS_USER="${R_LIBS_USER:-$HOME/R/library}"
+mkdir -p "$R_LIBS_USER"
+
 #!/usr/bin/env bash
 set -euo pipefail
 
