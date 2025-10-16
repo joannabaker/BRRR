@@ -56,17 +56,18 @@ pick_x_col <- function(df, regmodel, x_choice) {
 # ---------- Constants / mappings ----------
 REGION_LEVELS <- c("MOB","SEP","PAL","STR","AMY","HIP","SCH","NEO","MED","MES","CEREB","DIE")
 
-MODEL_LEVELS <- paste0("m", 1:9)
-MODEL_TO_FORM <- c(
-  m1 = "body",
-  m2 = "body~grp",
-  m3 = "body-Q",
-  m4 = "ROB",
-  m5 = "ROB-Q",
-  m6 = "ROB+body",
-  m7 = "ROB+body-Q",
-  m8 = "ROB-Q+body",
-  m9 = "ROB-Q+body-Q"
+
+# Regression model choices: names shown to user, values used internally
+REG_MODEL_CHOICES <- c(
+  "m1: body"                          = "m1",
+  "m2: body + group + group:body"                  = "m2",
+  "m3: body + body²"                  = "m3",
+  "m4: ROB"                           = "m4",
+  "m5: ROB + ROB²"                    = "m5",
+  "m6: ROB + body"                    = "m6",
+  "m7: ROB + body + body²"            = "m7",
+  "m8: ROB + ROB² + body"             = "m8",
+  "m9: ROB + ROB² + body + body²"     = "m9"
 )
 
 EVO_LEVELS <- c("glob","fab","bm","vr")
@@ -102,6 +103,14 @@ ui <- navbarPage(
     title = "Marginal Likelihoods",
     sidebarLayout(
       sidebarPanel(
+        
+        selectInput(
+          "ml_region_filter",
+          "Region filter",
+          choices = c("all regions", REGION_LEVELS),
+          selected = "all regions"
+        ),
+        
         radioButtons(
           "ml_plot_type",
           label = "Plot Type",
@@ -182,15 +191,21 @@ ui <- navbarPage(
         selectInput(
           "reg_evo_model",
           "Evolutionary model",
-          choices = EVO_LEVELS,
-          selected = "glob"
+          choices = c(
+            "fabric model"                         = "fab",
+            "fabric model with global trend"       = "glob",
+            "Brownian motion"                      = "bm",
+            "variable rates (VR)"                  = "vr"
+          ),
+          selected = "glob"   # keep the internal value here
         ),
         selectInput(
           "reg_regr_model",
           "Regression model",
-          choices = MODEL_LEVELS,
+          choices  = REG_MODEL_CHOICES,
           selected = "m1"
         ),
+        
         hr(),
         h4("Predicted relationship"),
         selectInput(
@@ -290,20 +305,8 @@ ui <- navbarPage(
           "input.reg_evo_model != 'bm'",
           h4("Phylogenetic tree"),
 
-          # FAB/GLOB: Beta probability slider (only when single replicate)
-          conditionalPanel(
-            "(input.reg_evo_model == 'fab' || input.reg_evo_model == 'glob') && input.pred_dataset != 'all replicates'",
-            sliderInput("fab_beta", "Beta probability", min = 0, max = 1, value = 0.95, step = 0.01)
-          ),
-
           plotOutput("tree_plot", height = "1000px"),
           downloadButton("download_tree_file", "Download tree (.nex)")
-        ),
-
-        # Legend for FAB/GLOB colouring (only when fab/glob + single replicate)
-        conditionalPanel(
-          "(input.reg_evo_model == 'fab' || input.reg_evo_model == 'glob') && input.pred_dataset != 'all replicates'",
-          plotOutput("fab_legend", height = "120px")
         ),
 
         # Legend for VR colouring (shown only when VR + single replicate + colouring enabled)
@@ -341,11 +344,21 @@ server <- function(input, output, session) {
   output$ml_plot <- renderPlot({
     df <- res_df()
     validate(need(!is.null(df), "No dataset available."))
+    
+    # --- Region filtering (case-insensitive column name) ---
+    reg_col <- names(df)[tolower(names(df)) == "region"][1]
+    if (!is.na(reg_col) && !identical(input$ml_region_filter, "all regions")) {
+      df <- df[df[[reg_col]] == input$ml_region_filter, , drop = FALSE]
+    }
+    validate(need(nrow(df) > 0, "No rows for the selected region."))
+    
+    # --- Existing plot logic (unchanged) ---
     if (input$ml_plot_type == "evolutionary model") {
       x_var <- "form"; group_var <- "form"; fill_var <- "form"; facet_var <- "model"; color_var <- "form"
     } else {
       x_var <- "model"; group_var <- "model"; fill_var <- "form"; facet_var <- "form"; color_var <- "model"
     }
+    
     ggplot(
       df,
       aes_string(x = x_var, y = "mL", group = group_var, fill = fill_var, color = color_var)
@@ -355,8 +368,7 @@ server <- function(input, output, session) {
       theme_bw() +
       labs(x = x_var, color = color_var, fill = fill_var, y = "mL")
   }, height = 1000)
-
-
+  
 
   # ---- Tab 2: ratematrix ----
   ratematrix_obj <- reactive({
@@ -425,7 +437,7 @@ server <- function(input, output, session) {
       geom_density(adjust = .5, alpha = 0.5) +
       scale_x_continuous(expand = expansion(mult = 0.02)) +
       scale_y_continuous(expand = expansion(mult = 0.02)) +
-
+      labs(x = "Variance", y = NULL) +
       theme(
         panel.grid.major = element_blank(),  # Remove major grid lines
         panel.grid.minor = element_blank(),  # Remove minor grid lines
@@ -478,8 +490,8 @@ server <- function(input, output, session) {
         axis.line = element_line(color = "black", linewidth = 0.5)
       ) +
       labs(
-        title = paste0("Correlations for regions starting with ", anchor_name),
-        x = "Correlation", y = NULL
+        title = paste0("Covariances for regions starting with ", anchor_name),
+        x = "Covariance", y = NULL
       )
   }, res = 120)
 
@@ -496,10 +508,15 @@ server <- function(input, output, session) {
 
   # -------- Regression formula (display under the title) --------
   output$reg_formula <- renderUI({
-    form <- MODEL_TO_FORM[[input$reg_regr_model]]
-    if (is.null(form)) form <- "(unknown model)"
-    tags$p(tags$strong("Regression formula: "), form)
+    # Find the label (name) corresponding to the selected value
+    lab <- names(REG_MODEL_CHOICES)[match(input$reg_regr_model, REG_MODEL_CHOICES)]
+    if (is.na(lab)) lab <- "(unknown model)"
+    # Strip the leading "m#: " if you only want the formula part:
+    pretty_lab <- sub("^m[1-9]:\\s*", "", lab)
+    tags$p(tags$strong("Regression formula: "), pretty_lab)
   })
+  
+  
 
   # 2) Predicted relationship plot (strict: sort + cbind medians and posterior)
 
@@ -619,137 +636,104 @@ server <- function(input, output, session) {
     list(df = df_org,x_col = x_col)
   })
 
+  # --- REPLACE load_summary_for_inset() with this exact version ---
   load_summary_for_inset <- reactive({
     # Only meaningful for a single replicate
     if (identical(input$pred_dataset, "all replicates")) return(NULL)
-
+    
     region   <- input$reg_region
     regmodel <- input$reg_regr_model
     evo_file <- if (tolower(input$reg_evo_model) == "vr") "VR" else tolower(input$reg_evo_model)
     tag      <- sprintf("%03d", as.integer(gsub("[^0-9]", "", input$pred_dataset)))
     path <- file.path("data", sprintf("%s_d1_%s-%s-%s-regSum.RDS", region, regmodel, evo_file, tag))
     if (!file.exists(path)) return(NULL)
-
+    
     obj <- tryCatch(readRDS(path), error = function(e) NULL)
     if (is.null(obj)) return(NULL)
-
-    df <- if (is.data.frame(obj)) obj else as.data.frame(obj, stringsAsFactors = FALSE)
-
-    # Make best effort to numeric-ify
-    if (requireNamespace("readr", quietly = TRUE)) {
-      suppressWarnings({
-        df <- readr::type_convert(df, guess_integer = TRUE, trim_ws = TRUE, locale = readr::locale(decimal_mark = "."))
-      })
-    }
-    df
+    
+    # Keep exactly as stored; don't coerce. Rownames must include "Median", "pMCMC".
+    if (is.data.frame(obj)) return(obj)
+    if (is.matrix(obj)) return(as.data.frame(obj, stringsAsFactors = FALSE))
+    as.data.frame(obj, stringsAsFactors = FALSE)
   })
+  
 
   extract_model_inset <- function(df, model_code) {
-    if (is.null(df)) return(NULL)
-
-    # Normalise names to lower, strip spaces
-    cn <- tolower(gsub("\\s+", "", names(df)))
-
-    # Two common shapes:
-    #  (i) wide: columns like "beta1median","beta1pmcmc","r2median"
-    #  (ii) long: a "parameter" column + statistic columns such as "median","pmcmc"
-    get_stat <- function(df, beta_idx = NULL, stat = c("median","pmcmc","r2")) {
-      stat <- match.arg(stat)
-
-      # Attempt wide first
-      wide_hit <- function(key) {
-        j <- match(key, cn)
-        if (!is.na(j)) suppressWarnings(as.numeric(df[[j]])) else NULL
-      }
-
-      # R2 (wide)
-      if (stat == "r2") {
-        out <- wide_hit("r2") %||% wide_hit("r2median") %||% wide_hit("medianr2")
-        if (!is.null(out)) return(out[1])
-      }
-
-      # Beta (wide)
-      if (!is.null(beta_idx)) {
-        base <- paste0("beta", beta_idx)
-        out  <- wide_hit(paste0(base,"median"))
-        if (is.null(out)) out <- wide_hit(base)
-        if (stat == "pmcmc") {
-          out2 <- wide_hit(paste0(base,"pmcmc"))
-          if (!is.null(out2)) return(out2[1])
-        }
-        if (!is.null(out)) return(out[1])
-      }
-
-      # Long format: look for a 'parameter' column and typical stat columns
-      pcol <- which(tolower(names(df)) %in% c("parameter","param","name"))[1]
-      if (!is.na(pcol)) {
-        par <- as.character(df[[pcol]])
-        nms <- tolower(names(df))
-        medcol <- which(nms %in% c("median","med","mean"))[1]
-        pmcol  <- which(nms %in% c("pmcmc","p.mcmc","pmc","p"))[1]
-        r2row  <- grep("^r2$", tolower(gsub("\\s+","",par)))
-        if (stat == "r2" && !is.na(medcol) && length(r2row)) return(suppressWarnings(as.numeric(df[r2row[1], medcol])))
-        if (!is.null(beta_idx)) {
-          brow <- grep(paste0("^beta\\s*",beta_idx,"$"), tolower(gsub("\\s+","",par)))
-          if (length(brow)) {
-            if (stat == "median" && !is.na(medcol)) return(suppressWarnings(as.numeric(df[brow[1], medcol])))
-            if (stat == "pmcmc"  && !is.na(pmcol))  return(suppressWarnings(as.numeric(df[brow[1], pmcol])))
-          }
-        }
-      }
-      NA_real_
+    if (is.null(df) || !NROW(df)) return(NULL)
+    
+    # Helper: exact row/column lookup → numeric
+    get_num <- function(row_lab, col_lab) {
+      if (!(row_lab %in% rownames(df))) return(NA_real_)
+      if (!(col_lab %in% colnames(df))) return(NA_real_)
+      suppressWarnings(as.numeric(df[row_lab, col_lab]))
     }
-
-    # Build text per model
-    fmt <- function(x, digits=3) if (is.na(x)) "NA" else formatC(x, digits=digits, format="fg", drop0trailing=TRUE)
-
+    
+    # Formatting: 4 dp for coefficients, 3 dp for p-values (as per your example)
+    fmt4 <- function(x) if (is.na(x)) "NA" else format(round(x, 4), nsmall = 4, trim = TRUE, scientific = FALSE)
+    fmt3 <- function(x) if (is.na(x)) "NA" else format(round(x, 3), nsmall = 3, trim = TRUE, scientific = FALSE)
+    
+    # Common pulls
+    R2 <- get_num("Median", "R^2")
+    B1 <- get_num("Median", "Beta 1"); P1 <- get_num("pMCMC", "Beta 1")
+    B2 <- get_num("Median", "Beta 2"); P2 <- get_num("pMCMC", "Beta 2")
+    B3 <- get_num("Median", "Beta 3"); P3 <- get_num("pMCMC", "Beta 3")
+    B4 <- get_num("Median", "Beta 4"); P4 <- get_num("pMCMC", "Beta 4")
+    
     txt <- switch(
       model_code,
-      "m1" = {
-        b1  <- get_stat(df, 1, "median"); p1 <- get_stat(df, 1, "pmcmc"); r2 <- get_stat(df, stat="r2")
-        paste0("median slope = ", fmt(b1), " [pₓ=", fmt(p1), "]\nR² = ", fmt(r2))
-      },
-      "m2" = {
-        r2 <- get_stat(df, stat="r2")
-        paste0("R² = ", fmt(r2), "\n(group diffs coming soon)")
-      },
-      "m3" = {
-        b1 <- get_stat(df,1,"median"); p1 <- get_stat(df,1,"pmcmc")
-        b2 <- get_stat(df,2,"median"); p2 <- get_stat(df,2,"pmcmc")
-        r2 <- get_stat(df, stat="r2")
-        paste0("body slope = ", fmt(b1), " [pₓ=", fmt(p1), "]\n",
-               "body quadratic = ", fmt(b2), " [pₓ=", fmt(p2), "]\n",
-               "R² = ", fmt(r2))
-      },
-      "m4" = {
-        b1 <- get_stat(df,1,"median"); r2 <- get_stat(df, stat="r2")
-        paste0("ROB slope = ", fmt(b1), "\nR² = ", fmt(r2))
-      },
-      "m5" = {
-        b1 <- get_stat(df,1,"median"); b2 <- get_stat(df,2,"median"); r2 <- get_stat(df, stat="r2")
-        paste0("ROB slope = ", fmt(b1), "\nROB quadratic = ", fmt(b2), "\nR² = ", fmt(r2))
-      },
-      "m6" = {
-        b1 <- get_stat(df,1,"median"); b2 <- get_stat(df,2,"median"); r2 <- get_stat(df, stat="r2")
-        paste0("ROB slope = ", fmt(b1), "\nbody slope = ", fmt(b2), "\nR² = ", fmt(r2))
-      },
-      "m7" = {
-        b1 <- get_stat(df,1,"median"); b2 <- get_stat(df,2,"median"); b3 <- get_stat(df,3,"median"); r2 <- get_stat(df, stat="r2")
-        paste0("ROB slope = ", fmt(b1), "\nbody slope = ", fmt(b2), "\nbody quadratic = ", fmt(b3), "\nR² = ", fmt(r2))
-      },
-      "m8" = {
-        b1 <- get_stat(df,1,"median"); b2 <- get_stat(df,2,"median"); b3 <- get_stat(df,3,"median"); r2 <- get_stat(df, stat="r2")
-        paste0("ROB slope = ", fmt(b1), "\nROB quadratic = ", fmt(b2), "\nbody slope = ", fmt(b3), "\nR² = ", fmt(r2))
-      },
-      "m9" = {
-        b1 <- get_stat(df,1,"median"); b2 <- get_stat(df,2,"median"); b3 <- get_stat(df,3,"median"); b4 <- get_stat(df,4,"median"); r2 <- get_stat(df, stat="r2")
-        paste0("ROB slope = ", fmt(b1), "\nROB quadratic = ", fmt(b2), "\nbody slope = ", fmt(b3), "\nbody quadratic = ", fmt(b4), "\nR² = ", fmt(r2))
-      },
+      "m1" = paste0(
+        "median slope = ", fmt4(B1), " [pₓ = ", fmt3(P1), "]\n",
+        "R² = ", fmt4(R2)
+      ),
+      "m2" = paste0(
+        "R² = ", fmt4(R2), "\n",
+        "(group diffs coming soon)"
+      ),
+      "m3" = paste0(
+        "body slope = ",        fmt4(B1), " [pₓ = ", fmt3(P1), "]\n",
+        "body quadratic = ",    fmt4(B2), " [pₓ = ", fmt3(P2), "]\n",
+        "R² = ", fmt4(R2)
+      ),
+      "m4" = paste0(
+        "ROB slope = ",         fmt4(B1), " [pₓ = ", fmt3(P1), "]\n",
+        "R² = ", fmt4(R2)
+      ),
+      "m5" = paste0(
+        "ROB slope = ",         fmt4(B1), " [pₓ = ", fmt3(P1), "]\n",
+        "ROB quadratic = ",     fmt4(B2), " [pₓ = ", fmt3(P2), "]\n",
+        "R² = ", fmt4(R2)
+      ),
+      "m6" = paste0(
+        "ROB slope = ",         fmt4(B1), " [pₓ = ", fmt3(P1), "]\n",
+        "body slope = ",        fmt4(B2), " [pₓ = ", fmt3(P2), "]\n",
+        "R² = ", fmt4(R2)
+      ),
+      "m7" = paste0(
+        "ROB slope = ",         fmt4(B1), " [pₓ = ", fmt3(P1), "]\n",
+        "body slope = ",        fmt4(B2), " [pₓ = ", fmt3(P2), "]\n",
+        "body quadratic = ",    fmt4(B3), " [pₓ = ", fmt3(P3), "]\n",
+        "R² = ", fmt4(R2)
+      ),
+      "m8" = paste0(
+        "ROB slope = ",         fmt4(B1), " [pₓ = ", fmt3(P1), "]\n",
+        "ROB quadratic = ",     fmt4(B2), " [pₓ = ", fmt3(P2), "]\n",
+        "body slope = ",        fmt4(B3), " [pₓ = ", fmt3(P3), "]\n",
+        "R² = ", fmt4(R2)
+      ),
+      "m9" = paste0(
+        "ROB slope = ",         fmt4(B1), " [pₓ = ", fmt3(P1), "]\n",
+        "ROB quadratic = ",     fmt4(B2), " [pₓ = ", fmt3(P2), "]\n",
+        "body slope = ",        fmt4(B3), " [pₓ = ", fmt3(P3), "]\n",
+        "body quadratic = ",    fmt4(B4), " [pₓ = ", fmt3(P4), "]\n",
+        "R² = ", fmt4(R2)
+      ),
       NULL
     )
-
+    
     list(text = txt)
   }
+  
+  
 
   output$pred_plot <- renderPlot({
     pd <- pred_data()
@@ -951,44 +935,64 @@ server <- function(input, output, session) {
     req(isTRUE(input$show_summary))
     path <- summary_paths()
     if (!file.exists(path)) return(NULL)
-
+    
     obj <- tryCatch(readRDS(path), error = function(e) NULL)
     if (is.null(obj)) return(NULL)
-
+    
     # Coerce to data.frame while preserving row names if present
-    if (is.matrix(obj)) {
-      df <- as.data.frame(obj, stringsAsFactors = FALSE)
-    } else if (is.data.frame(obj)) {
-      df <- obj
-    } else {
-      df <- as.data.frame(obj, stringsAsFactors = FALSE)
+    df <- if (is.data.frame(obj)) obj else as.data.frame(obj, stringsAsFactors = FALSE)
+    
+    if (nrow(df) == 0) return(df)
+    
+    # --- Keep top row verbatim; process the rest numerically ---
+    top_row <- df[1, , drop = FALSE]
+    rest    <- if (nrow(df) >= 2) df[-1, , drop = FALSE] else df[0, , drop = FALSE]
+    
+    if (nrow(rest)) {
+      # Best-effort numeric typing on the 'rest' only
+      if (requireNamespace("readr", quietly = TRUE)) {
+        suppressWarnings({
+          rest <- readr::type_convert(rest, guess_integer = TRUE, trim_ws = TRUE,
+                                      locale = readr::locale(decimal_mark = "."))
+        })
+      } else {
+        # Fallback: coerce character columns that are mostly numeric
+        is_mostly_numeric <- function(x) {
+          if (!is.character(x)) return(FALSE)
+          sup <- suppressWarnings(as.numeric(x))
+          sum(!is.na(sup)) >= (length(x) - 1L)
+        }
+        char_cols <- vapply(rest, is.character, logical(1))
+        mostly_num_cols <- names(rest)[char_cols & vapply(rest, is_mostly_numeric, logical(1))]
+        for (nm in mostly_num_cols) {
+          rest[[nm]] <- suppressWarnings(as.numeric(rest[[nm]]))
+        }
+      }
+      
+      # Round numeric columns (rows 2..n only)
+      num_cols <- vapply(rest, is.numeric, logical(1))
+      rest[num_cols] <- lapply(rest[num_cols], function(x) round(x, 4))
+      
+      # For display in DT (and to keep top row intact), convert the 'rest' to strings
+      # with consistent formatting for numerics.
+      fmt_num <- function(x) ifelse(is.na(x), NA_character_,
+                                    formatC(x, digits = 4, format = "fg", drop0trailing = TRUE))
+      for (nm in names(rest)) {
+        if (is.numeric(rest[[nm]])) {
+          rest[[nm]] <- fmt_num(rest[[nm]])
+        } else {
+          # keep as character as-is
+          rest[[nm]] <- as.character(rest[[nm]])
+        }
+      }
     }
-
-    # 1) Use readr::type_convert if available
-    if (requireNamespace("readr", quietly = TRUE)) {
-      suppressWarnings({
-        df <- readr::type_convert(df, guess_integer = TRUE, trim_ws = TRUE, locale = readr::locale(decimal_mark = "."))
-      })
-    }
-
-    # 2) For character columns that are mostly numeric, coerce to numeric
-    is_mostly_numeric <- function(x) {
-      if (!is.character(x)) return(FALSE)
-      sup <- suppressWarnings(as.numeric(x))
-      sum(!is.na(sup)) >= (length(x) - 1L)
-    }
-    char_cols <- vapply(df, is.character, logical(1))
-    mostly_num_cols <- names(df)[char_cols & vapply(df, is_mostly_numeric, logical(1))]
-    for (nm in mostly_num_cols) {
-      df[[nm]] <- suppressWarnings(as.numeric(df[[nm]]))
-    }
-
-    # 3) Round all numeric columns to 4 dp
-    num_cols <- vapply(df, is.numeric, logical(1))
-    df[num_cols] <- lapply(df[num_cols], function(x) round(x, 4))
-
-    df
+    
+    # Bind top row back on (everything is character now, preserving the text in row 1)
+    out <- rbind(top_row, rest)
+    rownames(out) <- rownames(df)  # preserve any original row names if present
+    out
   })
+  
 
   output$summary_status <- renderUI({
     req(isTRUE(input$show_summary))
@@ -1002,20 +1006,14 @@ server <- function(input, output, session) {
       tags$code(if (inherits(path, "try-error")) "(unknown path)" else path)
     )
   })
-
+  
   output$summary_table <- renderDT({
     req(isTRUE(input$show_summary))
     dat <- summary_data()
     req(!is.null(dat))
-    dt <- datatable(dat, rownames = TRUE, options = list(pageLength = 15, scrollX = TRUE))
-    # Format all numeric cols to 4 dp for consistent display
-    num_cols <- which(vapply(dat, is.numeric, logical(1)))
-    if (length(num_cols)) {
-      dt <- DT::formatRound(dt, columns = num_cols, digits = 4)
-    }
-    dt
+    datatable(dat, rownames = TRUE, options = list(pageLength = 15, scrollX = TRUE))
   })
-
+  
   output$download_summary_csv <- downloadHandler(
     filename = function() {
       region   <- input$reg_region
@@ -1097,40 +1095,76 @@ server <- function(input, output, session) {
 
   # -------- Tree plot + download (single replicate for glob/fab/vr) --------
 
-  vr_rate_tbl <- reactive({
+  # Read the VR rateSummary RDS once and prepare:
+  # - tree with branch lengths scaled by medianscalar[-1]
+  # - rate table without the first row (rt2)
+  # - posterior (for frequency thresholding in alt plot)
+  vr_data <- reactive({
     req(tolower(input$reg_evo_model) == "vr", input$pred_dataset != "all replicates")
+    
     region   <- input$reg_region
     regmodel <- input$reg_regr_model
     tag      <- sprintf("%03d", as.integer(gsub("[^0-9]", "", input$pred_dataset)))
-    src <- file.path("data", sprintf("%s_d1_%s-VR-%s-rateSummary.RDS", region, regmodel, tag))
-    validate(need(file.exists(src), paste0("VR rate summary not found: ", src)))
-    as.data.frame(readRDS(src))
+    
+    rds_path <- file.path("data", sprintf("%s_d1_%s-VR-%s-rateSummary.RDS", region, regmodel, tag))
+    validate(need(file.exists(rds_path), paste0("VR rate summary not found: ", rds_path)))
+    
+    obj <- readRDS(rds_path)
+    
+    # Extract components
+    validate(need(!is.null(obj$tree), "VR RDS does not contain a $tree object."))
+    validate(need(!is.null(obj$ratesummary), "VR RDS does not contain a $ratesummary table."))
+    
+    tr <- obj$tree
+    rt <- as.data.frame(obj$ratesummary, stringsAsFactors = FALSE)
+    
+    validate(need("medianscalar" %in% names(rt), "ratesummary must contain 'medianscalar'."))
+    
+    # Prepare the -1 version of the rates (rows map to edges)
+    rt2 <- rt[-1, , drop = FALSE]
+    
+    # Scale branch lengths by medianscalar[-1]
+    nE <- nrow(tr$edge)
+    ms <- rt$medianscalar[-1]
+    
+    if (length(ms) < nE) {
+      stop(sprintf("Not enough medianscalar values (%d) to match edges (%d).", length(ms), nE))
+    }
+    if (length(ms) > nE) {
+      ms <- ms[seq_len(nE)]  # truncate if an extra row sneaks in
+    }
+    validate(need(all(is.finite(ms) & ms > 0), "All medianscalar[-1] must be positive and finite."))
+    
+    tr$edge.length <- tr$edge.length * ms
+    
+    list(
+      tree      = tr,
+      rates2    = rt2,
+      posterior = obj$posterior  # used in the alt (magnitude/frequency) plot
+    )
   })
+  
 
-  fab_rates <- reactive({
-    req(tolower(input$reg_evo_model) %in% c("fab","glob"), input$pred_dataset != "all replicates")
+  # --- REPLACE the old fab_rates() reactive with this ---
+  fab_merged <- reactive({
+    req(tolower(input$reg_evo_model) %in% c("fab","glob"))
     region   <- input$reg_region
     regmodel <- input$reg_regr_model
     evo      <- tolower(input$reg_evo_model)
-    tag      <- sprintf("%03d", as.integer(gsub("[^0-9]", "", input$pred_dataset)))
-
-    csv_path <- file.path("data", sprintf("%s_d1_%s-%s-%s-FabPP.csv", region, regmodel, evo, tag))
-    validate(need(file.exists(csv_path), paste0("FabPP file not found: ", csv_path)))
-
-    # Preserve original column names (with spaces/symbols)
-    df <- utils::read.csv(csv_path, check.names = FALSE)
-    validate(need(nrow(df) >= 2, "FabPP file has insufficient rows."))
-
-    # 1) Drop first row per spec
+    
+    # One merged file across replicates, e.g. MED_d1_m7-glob-MergedFabricResults.csv
+    csv_path <- file.path("data", sprintf("%s_d1_%s-%s-MergedFabricResults.csv", region, regmodel, evo))
+    validate(need(file.exists(csv_path), paste0("Merged Fabric results not found: ", csv_path)))
+    
+    # Keep default check.names=TRUE so we get "Mean..Beta...BL..NZ" etc.
+    df <- utils::read.csv(csv_path, header = TRUE)
+    validate(need(nrow(df) >= 2, "Merged Fabric file has insufficient rows."))
+    
+    # Drop first row as specified
     df <- df[-1, , drop = FALSE]
-
-    # If first column looks like edge indices, use as rownames
-    if (!is.null(df[[1]]) && all(grepl("^[0-9]+$", as.character(df[[1]])))) {
-      rownames(df) <- as.character(df[[1]])
-    }
     df
   })
-
+  
   vr_edge_colors <- reactive({
     req(isTRUE(input$vr_color_branches))
     rt <- vr_rate_tbl()
@@ -1172,33 +1206,26 @@ server <- function(input, output, session) {
     req(tolower(input$reg_evo_model) == "vr",
         input$pred_dataset != "all replicates",
         isTRUE(input$vr_color_branches))
-
-    region   <- input$reg_region
-    regmodel <- input$reg_regr_model
-    tag      <- sprintf("%03d", as.integer(gsub("[^0-9]", "", input$pred_dataset)))
-    rate_path <- file.path("data", sprintf("%s_d1_%s-VR-%s-rateSummary.RDS", region, regmodel, tag))
-    validate(need(file.exists(rate_path), paste0("VR rate summary not found: ", rate_path)))
-
-    obj <- readRDS(rate_path)
-    rt  <- if (is.data.frame(obj)) obj else if (is.list(obj) && !is.null(obj$ratesummary)) obj$ratesummary else obj
-    rt  <- as.data.frame(rt, stringsAsFactors = FALSE)
-    validate(need("medianscalar" %in% names(rt), "rates table must contain 'medianscalar'."))
-
-    ms <- rt$medianscalar
+    
+    vd <- vr_data()
+    rt2 <- vd$rates2
+    validate(need("medianscalar" %in% names(rt2), "rates table must contain 'medianscalar'."))
+    
+    ms <- rt2$medianscalar
     validate(need(all(ms > 0, na.rm = TRUE), "All 'medianscalar' must be > 0 for log10 scaling."))
     ms_rounded <- round(ms, 2)
-
+    
     log_vals <- log10(ms_rounded)
-    rng <- range(log_vals, finite = TRUE, na.rm = TRUE)
+    rng  <- range(log_vals, finite = TRUE, na.rm = TRUE)
     grid <- seq(rng[1], rng[2], by = 0.01)
-
+    
     cols_in <- if (isTRUE(input$vr_use_mid)) {
       c(input$vr_col_start, input$vr_col_mid, input$vr_col_end)
     } else {
       c(input$vr_col_start, input$vr_col_end)
     }
-    lut <- grDevices::colorRampPalette(cols_in)(length(grid))  # same length used by findInterval mapping
-
+    lut <- grDevices::colorRampPalette(cols_in)(length(grid))
+    
     list(
       grid   = grid,
       lut    = lut,
@@ -1207,274 +1234,180 @@ server <- function(input, output, session) {
       max_s  = max(ms_rounded, na.rm = TRUE)
     )
   })
-
   output$tree_plot <- renderPlot({
     tryCatch({
       req(input$reg_evo_model != "bm")
       validate(need(input$pred_dataset != "all replicates",
                     "Tree plotting is only available for a single replicate."))
-
-      evo <- tolower(input$reg_evo_model)
+      
+      evo      <- tolower(input$reg_evo_model)
       region   <- input$reg_region
       regmodel <- input$reg_regr_model
       tag      <- sprintf("%03d", as.integer(gsub("[^0-9]", "", input$pred_dataset)))
-
+      
+      # Tree path (unchanged)
       tree_path <- if (evo %in% c("glob","fab")) {
         file.path("data", "regions_tree.trees")
       } else if (evo == "vr") {
         file.path("data", sprintf("%s_d1_%s-VR-%s-medTree.trees", region, regmodel, tag))
       } else NA_character_
-
+      
       validate(need(!is.na(tree_path) && file.exists(tree_path),
                     paste0("Tree file not found: ", tree_path)))
-
       tr <- ape::read.nexus(tree_path)
-
-      # ... inside tryCatch, after you computed evo/region/regmodel/tag and read tr ...
-
-      edge_cols <- NULL
-
-      if (evo %in% c("glob","fab")) {
-        # ---- FAB/GLOB: scale edge lengths and colour by Beta effects ----
-        rt <- fab_rates()
+      
+      # ---- FAB/GLOB colouring from merged CSV ----
+      if (evo %in% c("fab","glob")) {
+        fabsum <- fab_merged()  # from reactive above
         nE <- nrow(tr$edge)
-
-        # Get "Median Non 1" for edge-length scaling
-        col_mn1 <- "Median Non 1"
-        validate(need(col_mn1 %in% names(rt),
-                      paste0("FabPP table missing column '", col_mn1, "'.")))
-        scale_vec <- rep(1, nE)
-
-        # Map rows to edges by rownames if possible; otherwise fallback by position
-        idx_map <- suppressWarnings(as.integer(rownames(rt)))
-        if (all(is.finite(idx_map))) {
-          idx_use <- pmin(nE, pmax(1, idx_map))
-          scale_vec[idx_use] <- as.numeric(rt[[col_mn1]])
-        } else if (nrow(rt) == nE) {
-          scale_vec <- as.numeric(rt[[col_mn1]])
-        } else {
-          k <- min(nE, nrow(rt))
-          scale_vec[seq_len(k)] <- as.numeric(rt[[col_mn1]][seq_len(k)])
+        brcols <- rep("lightgrey", nE)
+        
+        # Safety: clamp any index set to available edges
+        clamp <- function(idx) idx[idx >= 1 & idx <= nE]
+        
+        # 1) purple for rows where No.Sig.Nodes == 6
+        if ("No.Sig.Nodes" %in% names(fabsum)) {
+          idx_node <- clamp(which(fabsum$No.Sig.Nodes == 6))
+          if (length(idx_node)) brcols[idx_node] <- "purple"
         }
-
-        # Apply edge-length scaling
-        tr$edge.length <- tr$edge.length * scale_vec
-
-        # --- Build colour vector from Mean(Beta*BL) with β probability filter ---
-        selcols <- rep("lightgrey", nE)
-
-        # Columns we need (names preserved by check.names=FALSE)
-        col_p_lt0 <- if ("P < 0" %in% names(rt)) "P < 0" else "P<0"
-        col_p_gt0 <- if ("P > 0" %in% names(rt)) "P > 0" else "P>0"
-        col_mean  <- "Mean (Beta * BL) NZ"
-        validate(need(col_mean %in% names(rt),
-                      paste0("FabPP table missing column '", col_mean, "'.")))
-        validate(need(all(c(col_p_lt0, col_p_gt0) %in% names(rt)),
-                      "FabPP table missing 'P < 0' and/or 'P > 0' columns."))
-
-        beta_thresh <- input$fab_beta
-        prob_ok <- (rt[[col_p_lt0]] >= beta_thresh) | (rt[[col_p_gt0]] >= beta_thresh)
-
-        vals <- as.numeric(rt[[col_mean]])
-        sel_idx_rows <- which(prob_ok)
-        vals_ok <- vals[sel_idx_rows]
-
-        if (length(vals_ok) && any(vals_ok != 0, na.rm = TRUE)) {
-          max_abs <- max(abs(vals_ok), na.rm = TRUE)
-          n_grad <- 200
-          blue_pal <- grDevices::colorRampPalette(c("lightblue", "#08306B"))(n_grad)  # neg
-          red_pal  <- grDevices::colorRampPalette(c("mistyrose", "#7F0000"))(n_grad)  # pos
-
-          # Edge index mapping for selected rows
-          if (all(is.finite(idx_map))) {
-            edge_idx <- pmin(nE, pmax(1, idx_map[sel_idx_rows]))
-          } else {
-            # fallback: assume row order aligns with edges
-            edge_idx <- pmin(nE, pmax(1, sel_idx_rows))
-          }
-
-          for (k in seq_along(sel_idx_rows)) {
-            v <- vals_ok[k]
-            if (is.na(v) || v == 0) next
-            id <- max(1, min(n_grad, ceiling(abs(v) / max_abs * n_grad)))
-            selcols[edge_idx[k]] <- if (v < 0) blue_pal[id] else red_pal[id]
+        
+        # 2) split where No.Sig.Betas == 6 by sign of Mean..Beta...BL..NZ
+        if (all(c("No.Sig.Betas","Mean..Beta...BL..NZ") %in% names(fabsum))) {
+          idx_beta <- which(fabsum$No.Sig.Betas == 6)
+          if (length(idx_beta)) {
+            vals <- fabsum$Mean..Beta...BL..NZ[idx_beta]
+            idx_neg <- clamp(idx_beta[which(vals < 0)])
+            idx_pos <- clamp(idx_beta[which(vals > 0)])
+            if (length(idx_neg)) brcols[idx_neg] <- "blue"
+            if (length(idx_pos)) brcols[idx_pos] <- "red"
           }
         }
-
-        edge_cols <- selcols
+        
+        par(mar = c(1,1,1,1))
+        ape::plot.phylo(tr, edge.color = brcols, edge.width = 2, show.tip.label = FALSE)
+        legend("topleft",
+               legend = c("node scalar", "positive beta", "negative beta"),
+               col    = c("purple", "red", "blue"),
+               lwd    = 3, bty = "n", cex = 0.9)
+        
+        # Little note as requested 🙂
+        mtext("Magnitudes coming soon… but Jo needs to sleep.", side = 1, line = -1.5, adj = 1, cex = 0.8)
+        
+        return(invisible(NULL))
       }
-
+      
+      # ---- existing VR branch (unchanged) ----
+      edge_cols <- NULL
       if (evo == "vr" && isTRUE(input$vr_color_branches)) {
         rate_path <- file.path("data", sprintf("%s_d1_%s-VR-%s-rateSummary.RDS", region, regmodel, tag))
         validate(need(file.exists(rate_path), paste0("VR rate summary not found: ", rate_path)))
         rt <- as.data.frame(readRDS(rate_path)$ratesummary)
         validate(need("medianscalar" %in% names(rt), "rates table must contain 'medianscalar'."))
-
         ms <- rt$medianscalar
         validate(need(all(ms > 0, na.rm = TRUE), "All 'medianscalar' must be > 0 to color by log10."))
         pal <- vr_palette_params()
         log_vals <- log10(round(ms, 2))
         idx <- findInterval(log_vals, pal$grid, all.inside = TRUE)
         cols_full <- pal$lut[idx]
-
-
         nE <- nrow(tr$edge)
         edge_cols <- if (length(cols_full) == nE + 1L) cols_full[-1L]
         else if (length(cols_full) == nE) cols_full
         else rep(cols_full, length.out = nE)
       }
-
+      
       par(mar = c(1,1,1,1))
-      if (!is.null(edge_cols)) ape::plot.phylo(tr, edge.color = edge_cols, edge.width = 2, show.tip.label = F)
-      else                     ape::plot.phylo(tr,                edge.width = 2, show.tip.label = F)
-
+      if (!is.null(edge_cols)) ape::plot.phylo(tr, edge.color = edge_cols, edge.width = 2, show.tip.label = FALSE)
+      else                     ape::plot.phylo(tr,                 edge.width = 2, show.tip.label = FALSE)
+      
       invisible(NULL)
     }, error = function(e) {
-      # draw the error in the plot area (prevents ggplot from being called)
       plot.new(); text(0.5, 0.5, labels = paste("Tree plot error:\n", e$message), cex = 0.9)
     })
   }, res = 96, height = 1000)
-
+  
+  
   output$tree_legend <- renderPlot({
     # Only for VR + single replicate
     req(tolower(input$reg_evo_model) == "vr", input$pred_dataset != "all replicates")
-
-    region   <- input$reg_region
-    regmodel <- input$reg_regr_model
-    tag      <- sprintf("%03d", as.integer(gsub("[^0-9]", "", input$pred_dataset)))
-
-    # Load the rates and extract medianscalar (>0)
-    rate_path <- file.path("data", sprintf("%s_d1_%s-VR-%s-rateSummary.RDS", region, regmodel, tag))
-    validate(need(file.exists(rate_path), paste0("VR rate summary not found: ", rate_path)))
-
-    obj <- readRDS(rate_path)
-    rt  <- if (is.data.frame(obj)) obj else if (is.list(obj) && !is.null(obj$ratesummary)) obj$ratesummary else obj
-    rt  <- as.data.frame(rt, stringsAsFactors = FALSE)
-    validate(need("medianscalar" %in% names(rt), "Rates table missing 'medianscalar'."))
-
-    ms <- rt$medianscalar
+    
+    # Pull the post-processed VR data (rates table after dropping first row)
+    vd  <- vr_data()
+    rt2 <- vd$rates2
+    validate(need("medianscalar" %in% names(rt2), "Rates table missing 'medianscalar'."))
+    
+    ms <- rt2$medianscalar
     ms <- ms[is.finite(ms) & ms > 0]
     validate(need(length(ms) > 0, "No positive medianscalar values to show."))
-
+    
     # Build colour grid in log10 space (same palette inputs as your tree)
     log_vals <- log10(round(ms, 2))
-    rng  <- range(log_vals, na.rm = TRUE)
+    rng    <- range(log_vals, na.rm = TRUE)
     grid_x <- seq(rng[1], rng[2], by = 0.01)
-
+    
     cols_in <- if (isTRUE(input$vr_use_mid)) {
       c(input$vr_col_start, input$vr_col_mid, input$vr_col_end)
     } else {
       c(input$vr_col_start, input$vr_col_end)
     }
     lut <- grDevices::colorRampPalette(cols_in)(length(grid_x))
-
+    
     # Tick labels in UN-logged space: min, median, 1, max (clamped to range)
     ticks_val <- c(min(ms), stats::median(ms), 1, max(ms))
     ticks_lab <- formatC(ticks_val, format = "fg", digits = 3, drop0trailing = TRUE)
     ticks_at  <- log10(ticks_val)
-    ticks_at  <- pmax(min(grid_x), pmin(max(grid_x), ticks_at))  # clamp
-
-    # ---- GRID DRAWING (no base par/plot.new) ----
+    ticks_at  <- pmax(min(grid_x), pmin(max(grid_x), ticks_at))  # clamp to gradient range
+    
+    # ---- GRID DRAWING ----
     grid::grid.newpage()
-
-    # Inset the drawing area a bit (so labels don’t get clipped)
     vp <- grid::viewport(
       x = 0.5, y = 0.5,
-      width  = grid::unit(0.92, "npc"),   # was 1 npc
-      height = grid::unit(0.80, "npc"),   # was 1 npc
+      width  = grid::unit(0.92, "npc"),
+      height = grid::unit(0.80, "npc"),
       just = c("center", "center"),
       xscale = range(grid_x), yscale = c(0, 1)
     )
     grid::pushViewport(vp)
-
-    # Draw full-width gradient (now inside the inset viewport)
+    
+    # Gradient bar
     grad <- matrix(lut, nrow = 1)
     grid::grid.raster(
       grad,
       x = grid::unit(0, "npc"),
-      y = grid::unit(0.60, "npc"),        # was 0.55
+      y = grid::unit(0.60, "npc"),
       width  = grid::unit(1, "npc"),
-      height = grid::unit(0.38, "npc"),   # was 0.35
+      height = grid::unit(0.38, "npc"),
       just = c("left", "center"),
       interpolate = TRUE
     )
-
-    # Tick marks & labels (lifted up a bit)
+    
+    # Ticks + labels
     for (i in seq_along(ticks_at)) {
       grid::grid.lines(
         x = grid::unit(c(ticks_at[i], ticks_at[i]), "native"),
-        y = grid::unit(c(0.42, 0.78), "npc"),      # was c(0.35, 0.70)
+        y = grid::unit(c(0.42, 0.78), "npc"),
         gp = grid::gpar(col = "black", lwd = 1)
       )
       grid::grid.text(
         ticks_lab[i],
         x = grid::unit(ticks_at[i], "native"),
-        y = grid::unit(0.22, "npc"),               # was 0.15
+        y = grid::unit(0.22, "npc"),
         just = c("center", "center"),
         gp = grid::gpar(cex = 0.95)
       )
     }
-
-    # Axis title (lifted a touch)
+    
+    # Title
     grid::grid.text(
       "medianscalar",
       x = grid::unit(0.5, "npc"),
-      y = grid::unit(0.08, "npc"),                 # was 0.02
+      y = grid::unit(0.08, "npc"),
       gp = grid::gpar(cex = 0.95)
     )
-
+    
     grid::popViewport()
   })
+  
 
-  output$fab_legend <- renderPlot({
-    req(tolower(input$reg_evo_model) %in% c("fab","glob"), input$pred_dataset != "all replicates")
-    rt <- fab_rates()
-
-    # Use the same filter as the plot
-    col_p_lt0 <- if ("P < 0" %in% names(rt)) "P < 0" else "P<0"
-    col_p_gt0 <- if ("P > 0" %in% names(rt)) "P > 0" else "P>0"
-    col_mean  <- "Mean (Beta * BL) NZ"
-    validate(need(all(c(col_mean, col_p_lt0, col_p_gt0) %in% names(rt)),
-                  "FabPP table missing required columns for legend."))
-
-    beta_thresh <- input$fab_beta
-    prob_ok <- (rt[[col_p_lt0]] >= beta_thresh) | (rt[[col_p_gt0]] >= beta_thresh)
-    vals <- as.numeric(rt[[col_mean]])
-    vals_ok <- vals[prob_ok]
-    validate(need(length(vals_ok) > 0, "No edges pass the selected β probability."))
-
-    max_abs <- max(abs(vals_ok), na.rm = TRUE)
-    n_grad  <- 256
-    blue_pal <- grDevices::colorRampPalette(c("lightblue", "#08306B"))(n_grad)  # neg
-    red_pal  <- grDevices::colorRampPalette(c("mistyrose", "#7F0000"))(n_grad)  # pos
-
-    # Draw with grid to avoid margin issues
-    grid::grid.newpage()
-    vp <- grid::viewport(x = 0.5, y = 0.5, width = grid::unit(0.95, "npc"), height = grid::unit(0.8, "npc"))
-    grid::pushViewport(vp)
-
-    # Left half (negative), right half (positive)
-    grid::grid.raster(matrix(blue_pal, nrow = 1),
-                      x = grid::unit(0.0, "npc"), y = grid::unit(0.6, "npc"),
-                      width = grid::unit(0.49, "npc"), height = grid::unit(0.35, "npc"),
-                      just = c("left","center"), interpolate = TRUE)
-    grid::grid.raster(matrix(red_pal, nrow = 1),
-                      x = grid::unit(0.51, "npc"), y = grid::unit(0.6, "npc"),
-                      width = grid::unit(0.49, "npc"), height = grid::unit(0.35, "npc"),
-                      just = c("left","center"), interpolate = TRUE)
-
-    # Labels
-    lab_neg <- paste0("−", formatC(max_abs, format = "fg", digits = 3))
-    lab_pos <- formatC(max_abs, format = "fg", digits = 3)
-
-    grid::grid.text(lab_neg, x = grid::unit(0.01, "npc"), y = grid::unit(0.20, "npc"), just = c("left","center"))
-    grid::grid.text("0",      x = grid::unit(0.50, "npc"), y = grid::unit(0.20, "npc"), just = c("center","center"))
-    grid::grid.text(lab_pos,  x = grid::unit(0.99, "npc"), y = grid::unit(0.20, "npc"), just = c("right","center"))
-    grid::grid.text("Mean(Beta × BL)  (negative → blue, positive → red)",
-                    x = grid::unit(0.5, "npc"), y = grid::unit(0.05, "npc"), just = c("center","center"))
-
-    grid::popViewport()
-  }, height = 120)
 
   # ---- Tree file download (keep only filename + content here) ----
   output$download_tree_file <- downloadHandler(
@@ -1519,53 +1452,42 @@ server <- function(input, output, session) {
   output$tree_plot_alt <- renderPlot({
     # Only for VR and a single replicate
     req(tolower(input$reg_evo_model) == "vr", input$pred_dataset != "all replicates")
-
-    region   <- input$reg_region
-    regmodel <- input$reg_regr_model
-    tag      <- sprintf("%03d", as.integer(gsub("[^0-9]", "", input$pred_dataset)))
-
-    # Read tree
-    tree_path <- file.path("data", sprintf("%s_d1_%s-VR-%s-medTree.trees", region, regmodel, tag))
-    validate(need(file.exists(tree_path), paste0("Tree file not found: ", tree_path)))
-    tr <- ape::read.nexus(tree_path)
-
-    # Read VR rate summary
-    rate_path <- file.path("data", sprintf("%s_d1_%s-VR-%s-rateSummary.RDS", region, regmodel, tag))
-    validate(need(file.exists(rate_path), paste0("VR rate summary not found: ", rate_path)))
-    obj <- readRDS(rate_path)
-    rt  <- obj$ratesummary
-
+    
+    vd <- vr_data()
+    tr  <- vd$tree
+    rt2 <- vd$rates2
+    
     # Total iterations (for frequency threshold)
-    denom_total <- ncol(obj$posterior) - 1
-
+    denom_total <- if (!is.null(vd$posterior)) ncol(vd$posterior) - 1 else NA_integer_
+    validate(need(is.finite(denom_total) && denom_total > 0, "Could not determine posterior iteration count."))
+    
     # Edges & base colours
     nE <- nrow(tr$edge)
     selcols <- rep("lightgrey", nE)
-
-    # Remove first row of rate table
-    rt <- rt[-1, , drop = FALSE]
-
+    
     # Thresholds
     mag  <- input$alt_mag
     freq <- input$alt_freq / 100
-
-    # Hits
-    hi_hits  <- which(rt$medianscalar >  mag & rt$n_scaled / denom_total > freq)
-    low_hits <- which(rt$medianscalar < (1 / mag) & rt$n_scaled / denom_total > freq)
-
+    
+    # Hits using rates2 (already -1)
+    validate(need(all(c("medianscalar","n_scaled") %in% names(rt2)), "rates table must contain 'medianscalar' and 'n_scaled'."))
+    hi_hits  <- which(rt2$medianscalar >  mag & (rt2$n_scaled / denom_total) > freq)
+    low_hits <- which(rt2$medianscalar < (1 / mag) & (rt2$n_scaled / denom_total) > freq)
+    
     # Clamp to available edges
     hi_hits  <- hi_hits[hi_hits <= nE]
     low_hits <- low_hits[low_hits <= nE]
-
+    
     # Apply colours
     if (length(hi_hits))  selcols[hi_hits]  <- "red"
     if (length(low_hits)) selcols[low_hits] <- "blue"
-
+    
     # Plot
     par(mar = c(1,1,1,1))
     ape::plot.phylo(tr, edge.color = selcols, show.tip.label = FALSE)
     invisible(NULL)
   }, res = 96, height = 1000)
+  
 
 }
 
