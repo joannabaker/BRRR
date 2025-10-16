@@ -8,5 +8,5 @@ Rscript -e 'install.packages(c(
 ), repos="https://cloud.r-project.org")'
 
 # If BayesTraitR is GitHub-only, install like this (comment out if on CRAN):
-Rscript -e 'if (!requireNamespace("BayesTraitR", quietly=TRUE)) remotes::install_github("mrborges23/BayesTraitR")'
+Rscript -e 'if (!requireNamespace("BayesTraitR", quietly=TRUE)) remotes::install_github("joannabaker/BayesTraitR")'
 chmod +x .devcontainer/post-create.sh
