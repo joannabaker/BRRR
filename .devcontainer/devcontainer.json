@@ -1,0 +1,29 @@
+{
+  "name": "R Shiny (Codespaces)",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {}
+  },
+  "containerEnv": {
+    "TZ": "UTC"
+  },
+  "forwardPorts": [3838],
+  "portsAttributes": {
+    "3838": {
+      "label": "Shiny",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "REditorSupport.r",
+        "ms-toolsai.jupyter",
+        "GitHub.vscode-pull-request-github"
+      ]
+    }
+  }
+}
