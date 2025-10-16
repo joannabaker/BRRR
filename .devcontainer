@@ -1,0 +1,27 @@
+{
+  "name": "R Shiny Dev",
+  "image": "rocker/r-ubuntu:latest",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {}
+  },
+  "postCreateCommand": "R -q -e \"if(!requireNamespace('renv', quietly=TRUE)) install.packages('renv'); renv::restore()\"",
+  "forwardPorts": [5555],
+  "portsAttributes": {
+    "5555": {
+      "label": "Shiny",
+      "onAutoForward": "notify",
+      "elevateIfNeeded": true
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "REditorSupport.r",
+        "Ikuyadeu.r",
+        "ms-vscode.live-server"
+      ]
+    }
+  },
+  "updateContentCommand": "",
+  "remoteUser": "rstudio"
+}
